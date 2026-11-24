@@ -1,0 +1,30 @@
+[
+ {
+  "id": "sakuraful",
+  "title": "Sakuraful March",
+  "artist": "さくらみこ",
+  "file": "sakuraful.mp3",
+  "duration": 174.2
+ },
+ {
+  "id": "grave",
+  "title": "Grave of Halo",
+  "artist": "アキ・ローゼンタール",
+  "file": "grave.mp3",
+  "duration": 126.1
+ },
+ {
+  "id": "paradise",
+  "title": "PARADISE",
+  "artist": "hololive IDOL PROJECT",
+  "file": "paradise.mp3",
+  "duration": 127.7
+ },
+ {
+  "id": "shiny",
+  "title": "Shiny Smily Story (2022 ver.)",
+  "artist": "ホロライブ",
+  "file": "shiny.mp3",
+  "duration": 103.4
+ }
+]
