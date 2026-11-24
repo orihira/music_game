@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Rhythm Stage</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b0b1a;color:#fff;font-family:system-ui,"Hiragino Sans","Yu Gothic",sans-serif;overflow:hidden;touch-action:none;user-select:none}
+#bg{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;opacity:.4;display:none}
+canvas{position:fixed;inset:0;width:100%;height:100%}
+.scr{position:fixed;inset:0;overflow:auto;padding:20px;display:none;background:#0b0b1af0}
+.scr.on{display:block}
+.wrap{max-width:760px;margin:auto}
+button,select,input{font:inherit;color:#fff;background:#2a2a52;border:1px solid #4b4b8f;border-radius:8px;padding:7px 11px}
+input[type=number]{width:80px}
+button{cursor:pointer}button:hover{background:#3a3a7a}
+.song{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px;margin:8px 0;background:#18183a;border-radius:12px}
+.song div{flex:1;min-width:160px}
+#bar{position:fixed;left:0;right:0;top:0;padding:8px;display:none;gap:6px;flex-wrap:wrap;background:#0b0b1ad9;align-items:center;font-size:13px}
+#bar input[type=range]{flex:1;min-width:120px;padding:0}
+.row{display:flex;gap:10px;align-items:center;margin:10px 0;flex-wrap:wrap}
+h1{margin:.2em 0}
+</style></head><body>
+<video id="bg" playsinline></video>
+<canvas id="cv"></canvas>
+<div id="bar"></div>
+
+<div class="scr on" id="menu"><div class="wrap">
+  <h1>🎵 Rhythm Stage</h1>
+  <div class="row">
+    <label><input type="file" id="up" accept="audio/*,video/mp4" hidden><button onclick="up.click()">＋ 楽曲追加 (mp3 / mp4)</button></label>
+    <button onclick="show('set')">⚙ 設定・判定</button><span id="msg"></span>
+  </div>
+  <small>PC: S D F Space J K L ／ スマホ: 画面下部をタッチ ／ Esc: 中断</small>
+  <div id="list"></div>
+</div></div>
+
+<div class="scr" id="set"><div class="wrap">
+  <h1>⚙ 設定</h1>
+  <p>判定幅 (±ms)。数値は目安なので自由に変更できます。</p>
+  <div class="row" id="presets"></div>
+  <div class="row">PERFECT <input type="number" id="w0"> GREAT <input type="number" id="w1"> GOOD <input type="number" id="w2"> BAD <input type="number" id="w3"></div>
+  <div class="row">ノーツ速度 <input type="range" id="spd" min="1" max="12"> <span id="spdv"></span></div>
+  <div class="row">音ズレ補正 (ms, +で譜面を遅らせる) <input type="number" id="off"></div>
+  <button onclick="show('menu')">戻る</button>
+</div></div>
+
+<div class="scr" id="res"><div class="wrap" id="resb"></div></div>
+
+<script src="chartgen.js"></script>
+<script>
+const $=s=>document.querySelector(s),LN=7,KEYS=['KeyS','KeyD','KeyF','Space','KeyJ','KeyK','KeyL'];
+const cv=$('#cv'),ctx=cv.getContext('2d'),md=$('#bg');
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+/* ---- 設定 (判定幅は [PERFECT,GREAT,GOOD,BAD] ms) ---- */
+const PRESETS={'プロセカ(目安)':[50,100,150,200],'ホロドリ(目安・仮)':[45,90,135,180],'厳しめ':[33,66,100,133]};
+let cfg={win:[50,100,150,200],speed:8,offset:0};
+try{Object.assign(cfg,JSON.parse(localStorage.rgcfg||'{}'))}catch(e){}
+const saveCfg=()=>{try{localStorage.rgcfg=JSON.stringify(cfg)}catch(e){}};
+function syncSet(){for(let i=0;i<4;i++)$('#w'+i).value=cfg.win[i];$('#spd').value=cfg.speed;$('#spdv').textContent=cfg.speed;$('#off').value=cfg.offset}
+for(const[k,v]of Object.entries(PRESETS)){const b=document.createElement('button');b.textContent=k;b.onclick=()=>{cfg.win=[...v];saveCfg();syncSet()};$('#presets').append(b)}
+for(let i=0;i<4;i++)$('#w'+i).oninput=e=>{cfg.win[i]=+e.target.value||0;saveCfg()};
+$('#spd').oninput=e=>{cfg.speed=+e.target.value;$('#spdv').textContent=cfg.speed;saveCfg()};
+$('#off').oninput=e=>{cfg.offset=+e.target.value||0;saveCfg()};syncSet();
+/* ---- 保存 (IndexedDB) ---- */
+const db=new Promise(r=>{const q=indexedDB.open('rg',1);q.onupgradeneeded=()=>q.result.createObjectStore('s',{keyPath:'id'});q.onsuccess=()=>r(q.result)});
+const idb=async(m,...a)=>{const d=await db;return new Promise((res,rej)=>{const q=d.transaction('s',m=='put'||m=='delete'?'readwrite':'readonly').objectStore('s')[m](...a);q.onsuccess=()=>res(q.result);q.onerror=rej})};
+const persist=s=>s.user?idb('put',{id:s.id,title:s.title,artist:s.artist,blob:s.blob,video:s.video,charts:s.charts,custom:s.custom,user:1}):idb('put',{id:'custom:'+s.id,custom:s.custom});
+/* ---- 楽曲 ---- */
+let songs=[],mode='menu';
+async function load(){
+  const idx=await (await fetch('songs/index.json')).json();songs=[];
+  for(const s of idx){const c=await (await fetch(`songs/${s.id}.json`)).json();const cu=await idb('get','custom:'+s.id);
+    songs.push({...s,charts:c.charts,custom:cu?cu.custom:{},url:'songs/'+s.file})}
+  for(const u of await idb('getAll'))if(u.user)songs.push({...u,url:URL.createObjectURL(u.blob)});
+  render();
+}
+function render(){
+  const L=$('#list');L.innerHTML='';
+  for(const s of songs){
+    const d=document.createElement('div');d.className='song';
+    d.innerHTML=`<div><b>${esc(s.title)}</b><br><small>${esc(s.artist)}${s.video?' · MV背景':''}</small></div>`;
+    const add=(label,notes)=>{const b=document.createElement('button');b.textContent=`${label} (${notes.length})`;b.onclick=()=>play(s,notes,label);d.append(b)};
+    for(const[k,v]of Object.entries(s.charts))add(k,v);
+    for(const[k,v]of Object.entries(s.custom))add('★'+k,v);
+    const e=document.createElement('button');e.textContent='✎ 作成';e.onclick=()=>openEdit(s);d.append(e);
+    if(s.user){const x=document.createElement('button');x.textContent='🗑';x.onclick=async()=>{if(confirm('削除しますか？')){await idb('delete',s.id);load()}};d.append(x)}
+    L.append(d);
+  }
+}
+function setMedia(s){md.pause();md.src=s.url;md.style.display=s.video?'block':'none';md.load()}
+function show(id){document.querySelectorAll('.scr').forEach(e=>e.classList.toggle('on',e.id==id));if(id=='menu'){mode='menu';md.pause();md.style.display='none';$('#bar').style.display='none'}}
+async function pcm(ab){const ac=new AudioContext({sampleRate:22050});const a=await ac.decodeAudioData(ab);const x=new Float32Array(a.length);
+  for(let c=0;c<a.numberOfChannels;c++){const d=a.getChannelData(c);for(let i=0;i<x.length;i++)x[i]+=d[i]/a.numberOfChannels}return x}
+$('#up').onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  const title=prompt('曲名',f.name.replace(/\.[^.]+$/,''))||f.name;
+  const auto=confirm('譜面を自動生成しますか？\n[キャンセル] = 自分で作成（作成した譜面が公式譜面になります）');
+  const s={id:'u'+Date.now(),title,artist:'(アップロード)',blob:f,video:f.type.startsWith('video'),charts:{},custom:{},user:1};
+  if(auto){$('#msg').textContent='解析中…';await new Promise(r=>setTimeout(r,50));
+    try{const x=await pcm(await f.arrayBuffer());for(const[k,g]of Object.entries(ChartGen.DIFFS))s.charts[k]=ChartGen.generate(x,22050,g)}
+    catch(err){alert('自動生成に失敗しました（譜面は自分で作成できます）: '+err.message)}}
+  await persist(s);e.target.value='';$('#msg').textContent='';await load();
+  if(!Object.keys(s.charts).length)openEdit(songs.find(v=>v.id==s.id));
+};
+/* ---- ゲーム ---- */
+let G=null;
+const J=['PERFECT','GREAT','GOOD','BAD','MISS'],JC=['#ffd54a','#ff7ab8','#6ee7ff','#aab','#889'],JW=[1,.8,.5,.2,0];
+function play(s,notes,label,back){
+  if(!back)setMedia(s);
+  G={s,label,back,n:notes.map(o=>({...o,st:0})),combo:0,max:0,cnt:[0,0,0,0,0],sum:0,devs:[],t0:performance.now()+1800,started:false,lastMT:-1,lastP:0,flash:[],ptr:{},held:{},msg:null};
+  G.end=Math.max(...G.n.map(n=>n.end||n.t),0)+1.5;
+  mode='play';show(null);$('#bar').style.display='none';
+}
+function reg(k,dev){G.cnt[k]++;G.sum+=JW[k];if(dev!=null&&k<4)G.devs.push(dev);
+  if(k<3){G.combo++;G.max=Math.max(G.max,G.combo)}else G.combo=0;G.msg={k,t:performance.now()}}
+function clock(){const p=performance.now();
+  if(!G.started){if(p>=G.t0){G.started=true;md.currentTime=0;md.play().catch(()=>{})}return (p-G.t0)/1000}
+  if(md.currentTime!==G.lastMT){G.lastMT=md.currentTime;G.lastP=p}
+  return md.currentTime+(md.paused?0:(p-G.lastP)/1000)}
+const T=()=>clock()-cfg.offset/1000;
+function press(l,id,isPtr){
+  const t=T();G.flash[l]=performance.now();let b=null;
+  for(const n of G.n)if(n.st==0&&n.lane==l&&Math.abs(n.t-t)<=cfg.win[3]/1000&&(!b||n.t<b.t))b=n;
+  if(!b)return;
+  const dev=(t-b.t)*1000,a=Math.abs(dev),k=a<=cfg.win[0]?0:a<=cfg.win[1]?1:a<=cfg.win[2]?2:3;
+  b.dev=dev;b.k=k;
+  if(b.type=='hold'){b.st=1;b.id=id;G.held[id]=b;reg(k,dev)}
+  else if(b.type=='flick'&&isPtr){b.st=1;b.id=id;b.pend=1;G.held[id]=b}
+  else{b.st=2;reg(k,dev)}
+}
+function release(id){
+  const n=G.held[id];if(!n)return;delete G.held[id];
+  if(n.type=='hold'){if(T()<n.end-.12){G.combo=0;G.msg={k:4,t:performance.now()}}n.st=2}
+  else if(n.pend){n.st=2;n.pend=0;reg(Math.max(n.k,2),n.dev)}
+}
+function quit(){md.pause();if(G.back=='edit')toEdit();else show('menu')}
+function finish(){
+  md.pause();const total=G.n.length||1,sc=Math.round(G.sum/total*1e6);
+  const avg=G.devs.length?G.devs.reduce((a,b)=>a+b,0)/G.devs.length:0;
+  $('#resb').innerHTML=`<h1>${esc(G.s.title)} [${esc(G.label)}]</h1><h2 style="font-size:48px;margin:.2em 0">${sc.toLocaleString()}</h2>
+  ${J.map((j,i)=>`<div style="color:${JC[i]}">${j}　${G.cnt[i]}</div>`).join('')}
+  <p>MAX COMBO ${G.max}　平均ズレ ${avg.toFixed(1)}ms (＋=遅い。大きい場合は設定の音ズレ補正で調整)</p>
+  <button id="rb">戻る</button>`;
+  mode='menu';show('res');$('#rb').onclick=()=>G.back=='edit'?toEdit():show('menu');
+}
+function geo(){const w=cv.width,h=cv.height,wb=Math.min(w*.96,h*.95);return{w,h,jy:h*.82,ty:h*.05,cx:w/2,wb,wt:wb*.38}}
+function pos(g,l,p){const ww=g.wt+(g.wb-g.wt)*p;return{x:g.cx+(l-(LN-1)/2)*ww/LN,w:ww/LN,y:g.ty+(g.jy-g.ty)*p}}
+function rr(x,y,w,h,r){ctx.beginPath();ctx.roundRect?ctx.roundRect(x,y,w,h,r):ctx.rect(x,y,w,h)}
+function drawPlay(){
+  const g=geo(),t=T(),ap=3.2/(.5+cfg.speed*.3),now=performance.now();
+  for(const n of G.n){
+    if(n.st==0&&t-n.t>cfg.win[3]/1000){n.st=2;reg(4)}
+    if(n.st==1&&n.type=='hold'&&t>=n.end){n.st=2;delete G.held[n.id]}
+  }
+  if(G.started&&(t>G.end||md.ended))return finish();
+  // lanes
+  ctx.fillStyle='#0d0d22d0';ctx.beginPath();
+  ctx.moveTo(g.cx-g.wt/2,g.ty);ctx.lineTo(g.cx+g.wt/2,g.ty);ctx.lineTo(g.cx+g.wb/2,g.jy);ctx.lineTo(g.cx-g.wb/2,g.jy);ctx.fill();
+  ctx.strokeStyle='#ffffff30';ctx.lineWidth=1;
+  for(let l=0;l<=LN;l++){const a=pos(g,l-.5,0),b=pos(g,l-.5,1);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke()}
+  for(let l=0;l<LN;l++)if(now-(G.flash[l]||-1e9)<150){const a=pos(g,l,1),f=1-(now-G.flash[l])/150;ctx.fillStyle=`rgba(255,255,255,${.25*f})`;ctx.fillRect(a.x-a.w/2,g.ty,a.w,g.jy-g.ty)}
+  ctx.strokeStyle='#fff';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(g.cx-g.wb/2,g.jy);ctx.lineTo(g.cx+g.wb/2,g.jy);ctx.stroke();
+  // notes (奥→手前)
+  for(let i=G.n.length-1;i>=0;i--){const n=G.n[i];if(n.st==2)continue;
+    let p=1-(n.t-t)/ap;if(p>1.12||(n.type!='hold'&&p<-.05))continue;
+    if(n.type=='hold'){const pe=1-(n.end-t)/ap;if(pe>1.12&&0)continue;
+      const ph=Math.min(Math.max(p,0),1),pt=Math.max(pe,0);if(pt>=1.2||pe<-.05)continue;
+      const a=pos(g,n.lane,ph),b=pos(g,n.lane,Math.min(pt,1));
+      ctx.fillStyle='#5eead480';ctx.beginPath();ctx.moveTo(a.x-a.w*.4,a.y);ctx.lineTo(a.x+a.w*.4,a.y);ctx.lineTo(b.x+b.w*.4,b.y);ctx.lineTo(b.x-b.w*.4,b.y);ctx.fill();
+      if(pe>0&&pe<1){rr(b.x-b.w*.46,b.y-5,b.w*.92,10,5);ctx.fillStyle='#34d399';ctx.fill()}
+      p=ph}
+    const a=pos(g,n.lane,p),h=Math.max(6,a.w*.28);
+    rr(a.x-a.w*.46,a.y-h/2,a.w*.92,h,h/2);
+    ctx.fillStyle=n.type=='flick'?'#38bdf8':n.type=='hold'?'#34d399':'#ff6fa8';ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+    if(n.type=='flick'){ctx.fillStyle='#fff';ctx.font=`${h*1.1}px sans-serif`;ctx.textAlign='center';ctx.fillText('▲',a.x,a.y+h*.4)}
+  }
+  // HUD
+  ctx.textAlign='center';
+  if(G.combo>1){ctx.fillStyle='#fff';ctx.font='bold 44px sans-serif';ctx.fillText(G.combo,g.cx,g.h*.35);ctx.font='14px sans-serif';ctx.fillText('COMBO',g.cx,g.h*.35+20)}
+  if(G.msg&&now-G.msg.t<500){ctx.fillStyle=JC[G.msg.k];ctx.font='bold 26px sans-serif';ctx.fillText(J[G.msg.k],g.cx,g.jy+60)}
+  ctx.fillStyle='#fff';ctx.textAlign='right';ctx.font='18px sans-serif';ctx.fillText(Math.round(G.sum/(G.n.length||1)*1e6).toLocaleString(),g.w-14,28);
+  if(t<0){ctx.textAlign='center';ctx.font='bold 40px sans-serif';ctx.fillText(Math.ceil(-t),g.cx,g.h*.45)}
+}
+/* ---- 入力 ---- */
+const laneAt=e=>{const g=geo();return Math.max(0,Math.min(LN-1,Math.floor((e.clientX-(g.cx-g.wb/2))/(g.wb/LN))))};
+addEventListener('keydown',e=>{
+  if(e.code=='Escape'){if(mode=='play')quit();return}
+  const l=KEYS.indexOf(e.code);if(l<0||e.repeat||['INPUT','SELECT'].includes(e.target.tagName))return;e.preventDefault();
+  if(mode=='play')press(l,e.code,false);
+  else if(mode=='edit'&&E.rec&&E.playing)E.notes.push({t:+md.currentTime.toFixed(3),lane:l,type:'tap'});
+});
+addEventListener('keyup',e=>{if(mode=='play')release(e.code)});
+cv.addEventListener('pointerdown',e=>{
+  if(mode=='edit')return editClick(e);
+  if(mode!='play'||e.clientY<cv.height*.3)return;
+  cv.setPointerCapture(e.pointerId);G.ptr[e.pointerId]=e.clientY;press(laneAt(e),e.pointerId,true)});
+cv.addEventListener('pointermove',e=>{if(mode!='play')return;const n=G.held[e.pointerId];
+  if(n&&n.pend&&e.clientY<G.ptr[e.pointerId]-24){n.pend=0;n.st=2;delete G.held[e.pointerId];reg(n.k,n.dev)}});
+['pointerup','pointercancel'].forEach(v=>cv.addEventListener(v,e=>{if(mode=='play')release(e.pointerId)}));
+/* ---- クリエイト画面 ---- */
+let E=null;
+function openEdit(s){
+  setMedia(s);md.style.display='none';
+  E={s,notes:[],t:0,playing:false,bpm:120,off:0,snap:4,tool:'tap',pend:null,rec:false,pps:280};
+  const names=[...Object.keys(s.charts).map(k=>'公式:'+k),...Object.keys(s.custom).map(k=>'★'+k)];
+  $('#bar').innerHTML=`<button id="e_play">▶</button><input type="range" id="e_seek" min="0" max="300" step="0.01" value="0"><span id="e_time">0.00</span>
+  BPM<input type="number" id="e_bpm" value="120"> 開始(s)<input type="number" id="e_off" value="0" step="0.01">
+  <select id="e_snap"><option value="0">スナップ無</option><option value="1">1/4</option><option value="2">1/8</option><option value="4" selected>1/16</option></select>
+  <select id="e_tool"><option value="tap">TAP</option><option value="hold">HOLD(2クリック)</option><option value="flick">FLICK</option></select>
+  <label><input type="checkbox" id="e_rec"> 再生中キー録音</label>
+  <select id="e_base"><option value="">読込…</option><option value="clear">空にする</option>${names.map((n,i)=>`<option value="${i}">${esc(n)}</option>`).join('')}<option value="a0">自動生成 NORMAL</option><option value="a1">自動生成 HARD</option></select>
+  <button id="e_test">テスト</button><button id="e_save">保存</button><button id="e_exp">書出</button><button id="e_back">戻る</button>`;
+  const q=id=>$('#'+id);
+  md.onloadedmetadata=()=>q('e_seek').max=md.duration;
+  q('e_play').onclick=()=>{E.playing=!E.playing;if(E.playing){md.currentTime=E.t;md.play()}else{E.t=md.currentTime;md.pause()}q('e_play').textContent=E.playing?'⏸':'▶'};
+  q('e_seek').oninput=e=>{E.t=+e.target.value;md.currentTime=E.t};
+  q('e_bpm').oninput=e=>E.bpm=+e.target.value||120;q('e_off').oninput=e=>E.off=+e.target.value||0;
+  q('e_snap').onchange=e=>E.snap=+e.target.value;q('e_tool').onchange=e=>{E.tool=e.target.value;E.pend=null};
+  q('e_rec').onchange=e=>E.rec=e.target.checked;
+  q('e_base').onchange=async e=>{const v=e.target.value;e.target.value='';if(!v)return;
+    if(v=='clear')E.notes=[];
+    else if(v[0]=='a'){$('#e_time').textContent='解析中…';try{const x=await pcm(await (await fetch(s.url)).arrayBuffer());E.notes=ChartGen.generate(x,22050,[.26,.15][+v[1]])}catch(err){alert('失敗: '+err.message)}}
+    else{const all=[...Object.values(s.charts),...Object.values(s.custom)];E.notes=all[+v].map(n=>({...n}))}};
+  q('e_test').onclick=()=>{if(E.playing)q('e_play').click();play(s,E.notes.slice().sort((a,b)=>a.t-b.t),'TEST','edit')};
+  q('e_save').onclick=()=>{const name=prompt('譜面名','MY CHART');if(!name)return;
+    const official=s.user&&!Object.keys(s.charts).length;(official?s.charts:s.custom)[name]=E.notes.slice().sort((a,b)=>a.t-b.t);
+    persist(s);alert(official?'公式譜面として保存しました':'★譜面として保存しました');render()};
+  q('e_exp').onclick=()=>{const name=prompt('譜面名','MY CHART');if(!name)return;
+    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({id:s.id,title:s.title,charts:{[name]:E.notes.slice().sort((a,b)=>a.t-b.t)}})],{type:'application/json'}));a.download=`${s.id}_${name}.json`;a.click()};
+  q('e_back').onclick=()=>{md.pause();show('menu');render()};
+  toEdit();
+}
+function toEdit(){mode='edit';show(null);$('#bar').style.display='flex';md.style.display=E.s.video?'block':'none'}
+cv.addEventListener('wheel',e=>{if(mode=='edit'&&!E.playing){E.t=Math.max(0,E.t-e.deltaY/E.pps);md.currentTime=E.t}});
+function editClick(e){
+  if(e.clientY<60)return;
+  const w=cv.width,x0=w*.15,wl=w*.7,jy=cv.height*.78,l=Math.floor((e.clientX-x0)/(wl/LN));if(l<0||l>=LN)return;
+  let tn=E.cur+(jy-e.clientY)/E.pps;const st=E.snap?60/E.bpm/E.snap:0;
+  if(st)tn=E.off+Math.round((tn-E.off)/st)*st;tn=Math.max(0,+tn.toFixed(3));
+  const tol=Math.max(st/2,.06),i=E.notes.findIndex(n=>n.lane==l&&tn>=n.t-tol&&tn<=(n.end||n.t)+tol);
+  if(i>=0){E.notes.splice(i,1);return}
+  if(E.tool=='hold'){if(E.pend){const p=E.pend;E.pend=null;E.notes.push({t:p.t,lane:p.lane,type:'hold',end:Math.max(tn,p.t+.1)})}else E.pend={t:tn,lane:l}}
+  else E.notes.push({t:tn,lane:l,type:E.tool});
+}
+function drawEdit(){
+  const w=cv.width,h=cv.height,x0=w*.15,wl=w*.7,jy=h*.78,pps=E.pps,lw=wl/LN;
+  const t=E.playing?md.currentTime:E.t;E.cur=t;
+  if(E.playing){$('#e_seek').value=t;if(md.ended){E.playing=false;$('#e_play').textContent='▶'}}
+  $('#e_time').textContent=t.toFixed(2)+'s / '+E.notes.length+'notes';
+  const Y=tn=>jy-(tn-t)*pps;
+  ctx.fillStyle='#0d0d22d0';ctx.fillRect(x0,0,wl,h);
+  ctx.strokeStyle='#ffffff30';for(let l=0;l<=LN;l++){ctx.beginPath();ctx.moveTo(x0+l*lw,0);ctx.lineTo(x0+l*lw,h);ctx.stroke()}
+  const beat=60/E.bpm,sub=E.snap?beat/E.snap:beat;
+  for(let k=Math.floor((t-jy/pps*0-(h-jy)/pps-E.off)/sub);;k++){const tt=E.off+k*sub,y=Y(tt);if(y<0)break;if(y>h)continue;
+    ctx.strokeStyle=Math.abs(((tt-E.off)/beat)%1)<1e-6||Math.abs(((tt-E.off)/beat)%1-1)<1e-6?'#ffffff50':'#ffffff18';ctx.beginPath();ctx.moveTo(x0,y);ctx.lineTo(x0+wl,y);ctx.stroke()}
+  for(const n of E.notes){const y=Y(n.t),x=x0+n.lane*lw;if(y<-20&&(!n.end||Y(n.end)<-20)||y>h+20)continue;
+    if(n.type=='hold'){ctx.fillStyle='#34d39988';ctx.fillRect(x+lw*.15,Y(n.end),lw*.7,y-Y(n.end))}
+    rr(x+lw*.05,y-8,lw*.9,16,8);ctx.fillStyle=n.type=='flick'?'#38bdf8':n.type=='hold'?'#34d399':'#ff6fa8';ctx.fill()}
+  if(E.pend){ctx.strokeStyle='#fff';ctx.strokeRect(x0+E.pend.lane*lw,Y(E.pend.t)-8,lw,16)}
+  ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x0,jy);ctx.lineTo(x0+wl,jy);ctx.stroke();ctx.lineWidth=1;
+}
+/* ---- ループ ---- */
+function rs(){cv.width=innerWidth;cv.height=innerHeight}addEventListener('resize',rs);rs();
+(function loop(){ctx.clearRect(0,0,cv.width,cv.height);if(mode=='play'&&G)drawPlay();else if(mode=='edit'&&E)drawEdit();requestAnimationFrame(loop)})();
+load().catch(e=>{$('#list').innerHTML='<p>読み込み失敗: ローカルでは <code>python -m http.server</code> で開いてください。<br>'+esc(e.message)+'</p>'});
+</script></body></html>
